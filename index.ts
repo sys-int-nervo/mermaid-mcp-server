@@ -12,6 +12,10 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { IconManager } from "./src/icons/IconManager.js";
+import { getIconConfig } from "./src/icons/config.js";
+import { IconSearchOptions } from "./src/icons/types.js";
+import { MermaidIconIntegration } from "./src/icons/MermaidIconIntegration.js";
 
 /**
  * Mermaid MCP Server
@@ -71,6 +75,38 @@ const LOG_VERBOSITY = process.env.MERMAID_LOG_VERBOSITY
 
 // Check if content images are supported (default: true)
 const CONTENT_IMAGE_SUPPORTED = process.env.CONTENT_IMAGE_SUPPORTED !== "false";
+
+// Initialize icon manager
+let iconManager: IconManager | null = null;
+let mermaidIconIntegration: MermaidIconIntegration | null = null;
+
+async function initializeIconManager() {
+  try {
+    log(LogLevel.INFO, "Initializing icon management system...");
+    const config = getIconConfig();
+    iconManager = new IconManager({
+      config,
+      autoLoad: true,
+      verbose: LOG_VERBOSITY >= LogLevel.INFO,
+    });
+    
+    const result = await iconManager.loadIcons();
+    if (result.success) {
+      log(LogLevel.INFO, `Icon system initialized: ${result.loaded} icons loaded in ${result.duration}ms`);
+    } else {
+      log(LogLevel.WARNING, `Icon system initialized with errors: ${result.loaded} loaded, ${result.failed} failed`);
+      if (result.errors.length > 0) {
+        log(LogLevel.WARNING, `Icon loading errors: ${result.errors.join(', ')}`);
+      }
+    }
+
+    // Initialize Mermaid icon integration
+    mermaidIconIntegration = new MermaidIconIntegration(iconManager);
+    log(LogLevel.INFO, "Mermaid icon integration initialized");
+  } catch (error) {
+    log(LogLevel.ERROR, `Failed to initialize icon system: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 // Convert LogLevel to MCP log level string
 function getMcpLogLevel(
@@ -149,6 +185,93 @@ const GENERATE_TOOL: Tool = {
       },
     },
     required: CONTENT_IMAGE_SUPPORTED ? ["code"] : ["code", "name", "folder"],
+  },
+};
+
+// Icon management tools
+const SEARCH_ICONS_TOOL: Tool = {
+  name: "search_icons",
+  description: "Search for icons across all loaded icon sources (FontAwesome, Iconify, LucidChart, etc.)",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Search query to find icons by name or tags (optional)",
+      },
+      categories: {
+        type: "array",
+        items: { type: "string" },
+        description: "Filter by categories (e.g., 'interface', 'communication', 'brands')",
+      },
+      sources: {
+        type: "array",
+        items: { type: "string" },
+        description: "Filter by icon sources (e.g., 'fontawesome', 'iconify', 'lucidchart')",
+      },
+      styles: {
+        type: "array",
+        items: { type: "string" },
+        description: "Filter by icon styles (e.g., 'solid', 'regular', 'brands')",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of results to return (default: 50)",
+        minimum: 1,
+        maximum: 200,
+      },
+      offset: {
+        type: "number",
+        description: "Number of results to skip for pagination (default: 0)",
+        minimum: 0,
+      },
+    },
+    required: [],
+  },
+};
+
+const GET_ICON_TOOL: Tool = {
+  name: "get_icon",
+  description: "Get a specific icon by its ID, including SVG content and metadata",
+  inputSchema: {
+    type: "object",
+    properties: {
+      iconId: {
+        type: "string",
+        description: "The unique ID of the icon to retrieve",
+      },
+    },
+    required: ["iconId"],
+  },
+};
+
+const LIST_CATEGORIES_TOOL: Tool = {
+  name: "list_categories",
+  description: "List all available icon categories",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    required: [],
+  },
+};
+
+const LIST_THEMES_TOOL: Tool = {
+  name: "list_themes",
+  description: "List all available icon themes and orientations",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    required: [],
+  },
+};
+
+const ICON_STATS_TOOL: Tool = {
+  name: "icon_stats",
+  description: "Get statistics about the loaded icon system",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    required: [],
   },
 };
 
@@ -231,6 +354,28 @@ async function renderMermaid(
       log(LogLevel.DEBUG, text);
     });
 
+    // Preprocess code for icon integration
+    let processedCode = code;
+    let iconDefinitions = '';
+    let iconStyles = '';
+    
+    if (mermaidIconIntegration) {
+      try {
+        const iconResult = await mermaidIconIntegration.preprocessMermaidCode(code);
+        processedCode = iconResult.processedCode;
+        iconDefinitions = mermaidIconIntegration.generateSvgDefs(iconResult.iconDefinitions);
+        iconStyles = mermaidIconIntegration.generateIconStyles();
+        
+        if (iconResult.usedIcons.length > 0) {
+          log(LogLevel.INFO, `Integrated ${iconResult.usedIcons.length} icons into diagram`);
+          log(LogLevel.DEBUG, `Used icons: ${iconResult.usedIcons.map(i => i.name).join(', ')}`);
+        }
+      } catch (error) {
+        log(LogLevel.WARNING, `Icon integration failed: ${error instanceof Error ? error.message : String(error)}`);
+        // Continue with original code if icon integration fails
+      }
+    }
+
     // Create a simple HTML template without the CDN reference
     const htmlContent = `
     <!DOCTYPE html>
@@ -248,8 +393,12 @@ async function renderMermaid(
           margin: 0;
         }
       </style>
+      ${iconStyles}
     </head>
     <body>
+      <svg style="display: none;">
+        ${iconDefinitions}
+      </svg>
       <div id="container"></div>
     </body>
     </html>
@@ -265,8 +414,8 @@ async function renderMermaid(
     const tempHtmlPath = path.join(__dirname, "temp-mermaid.html");
     fs.writeFileSync(tempHtmlPath, htmlContent);
 
-    log(LogLevel.INFO, `Rendering mermaid code: ${code.substring(0, 50)}...`);
-    log(LogLevel.DEBUG, `Full mermaid code: ${code}`);
+      log(LogLevel.INFO, `Rendering mermaid code: ${code.substring(0, 50)}...`);
+  log(LogLevel.DEBUG, `Full mermaid code: ${code}`);
 
     // Navigate to the HTML file
     await page.goto(`file://${tempHtmlPath}`);
@@ -322,7 +471,7 @@ async function renderMermaid(
           };
         }
       },
-      code,
+      processedCode,
       { theme: config.theme, backgroundColor: config.backgroundColor }
     );
 
@@ -643,7 +792,14 @@ async function processGenerateRequest(args: {
 
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [GENERATE_TOOL],
+  tools: [
+    GENERATE_TOOL,
+    SEARCH_ICONS_TOOL,
+    GET_ICON_TOOL,
+    LIST_CATEGORIES_TOOL,
+    LIST_THEMES_TOOL,
+    ICON_STATS_TOOL,
+  ],
 }));
 
 // Set up the request handler for tool calls
@@ -670,6 +826,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await processGenerateRequest(args);
     }
 
+    // Icon management tools
+    if (name === "search_icons") {
+      return await handleSearchIcons(args);
+    }
+
+    if (name === "get_icon") {
+      return await handleGetIcon(args);
+    }
+
+    if (name === "list_categories") {
+      return await handleListCategories();
+    }
+
+    if (name === "list_themes") {
+      return await handleListThemes();
+    }
+
+    if (name === "icon_stats") {
+      return await handleIconStats();
+    }
+
     return {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
       isError: true,
@@ -689,7 +866,157 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+// Icon management handlers
+async function handleSearchIcons(args: any) {
+  if (!iconManager) {
+    return {
+      content: [{ type: "text", text: "Icon system not initialized" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const searchOptions: IconSearchOptions = {
+      query: args.query,
+      categories: args.categories,
+      sources: args.sources,
+      styles: args.styles,
+      limit: args.limit || 50,
+      offset: args.offset || 0,
+    };
+
+    const result = await iconManager.searchIcons(searchOptions);
+    
+    const response = {
+      total: result.total,
+      hasMore: result.hasMore,
+      icons: result.icons.map(icon => ({
+        id: icon.id,
+        name: icon.name,
+        category: icon.category,
+        tags: icon.tags,
+        source: icon.source,
+        styles: icon.styles,
+        license: icon.license,
+      })),
+    };
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error searching icons: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleGetIcon(args: any) {
+  if (!iconManager) {
+    return {
+      content: [{ type: "text", text: "Icon system not initialized" }],
+      isError: true,
+    };
+  }
+
+  if (!args.iconId) {
+    return {
+      content: [{ type: "text", text: "iconId parameter is required" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const icon = iconManager.getIcon(args.iconId);
+    
+    if (!icon) {
+      return {
+        content: [{ type: "text", text: `Icon not found: ${args.iconId}` }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(icon, null, 2) }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error getting icon: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleListCategories() {
+  if (!iconManager) {
+    return {
+      content: [{ type: "text", text: "Icon system not initialized" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const categories = iconManager.getCategories();
+    return {
+      content: [{ type: "text", text: JSON.stringify({ categories }, null, 2) }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error listing categories: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleListThemes() {
+  if (!iconManager) {
+    return {
+      content: [{ type: "text", text: "Icon system not initialized" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const themes = iconManager.getThemes();
+    const orientations = iconManager.getOrientations();
+    
+    return {
+      content: [{ type: "text", text: JSON.stringify({ themes, orientations }, null, 2) }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error listing themes: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleIconStats() {
+  if (!iconManager) {
+    return {
+      content: [{ type: "text", text: "Icon system not initialized" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const stats = iconManager.getStats();
+    return {
+      content: [{ type: "text", text: JSON.stringify(stats, null, 2) }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error getting stats: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+}
+
 async function runServer() {
+  // Initialize icon system first
+  await initializeIconManager();
+  
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log(LogLevel.INFO, "Mermaid MCP Server running on stdio");
